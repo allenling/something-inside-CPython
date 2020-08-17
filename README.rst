@@ -205,3 +205,22 @@ thread.rst
 能不能手动终止线程?
 
 
+GIL
+=======
+
+gil.rst
+
+护航效应?
+
+
+
+memory management
+======================
+
+memory_management.rst
+
+内置对象都有预分配的缓存池
+
+CPython中如何管理缓存池?
+
+
