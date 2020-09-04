@@ -28,7 +28,7 @@ CPython的线程是系统线程的一个包装, 调度上还是依赖于操作�
 
 _start_new_thread则是创建一个bootstate去保存传入的func, args, kwarg等信息, 然后调用系统调用去创建和启动系统
 
-.. code-block:: c
+.. code-block:: c++
 
     static PyObject *
     thread_PyThread_start_new_thread(PyObject *self, PyObject *fargs)
@@ -72,7 +72,7 @@ _start_new_thread则是创建一个bootstate去保存传入的func, args, kwarg�
 
 为什么不传入python的函数, 因为系统不能执行python代码呀, 所以要使用另外一个c函数去启动python代码, 这个c函数这里就是t_bootstrap
 
-.. code-block:: c
+.. code-block:: c++
 
     static void
     t_bootstrap(void *boot_raw)
@@ -149,7 +149,7 @@ self.join是等待线程结束, 其是检查线程状态锁self._tstate_lock是�
             self._set_ident()
             self._set_tstate_lock()
 
-.. code-block:: c
+.. code-block:: c++
 
     static PyObject *
     thread__set_sentinel(PyObject *self)
@@ -179,7 +179,7 @@ self.join是等待线程结束, 其是检查线程状态锁self._tstate_lock是�
 在系统线程要退出的时候, 释放该锁
 
 
-.. code-block:: c
+.. code-block:: c++
 
     static void
     t_bootstrap(void *boot_raw)
@@ -305,7 +305,7 @@ https://github.com/Bogdanp/dramatiq/blob/95cd9f6f35f1b40c138124cbb96e3667db088ef
 
 使用ctype调用PyThreadState_SetAsyncExc, 这个函数是把获取指定线程的信息结构tstate, 然后把指定异常设置到该tstate中
 
-.. code-block:: c
+.. code-block:: c++
 
     PyThreadState_SetAsyncExc(long id, PyObject *exc) {
         PyInterpreterState *interp = GET_INTERP_STATE();

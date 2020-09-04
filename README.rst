@@ -40,7 +40,7 @@ python执行字节码的程序有时候被称为虚拟机, 有时候被称为解
 其中会进入到ROT_TWO这个字节码中, 在C实现中我们首先找到当前解释器, 然后调用解释器去执行当前帧(frame, codeobject这些先不要纠结)
 
 
-.. code-block:: c
+.. code-block:: c++
 
     PyObject *
     PyEval_EvalFrameEx(PyFrameObject *f, int throwflag)
@@ -53,7 +53,7 @@ python执行字节码的程序有时候被称为虚拟机, 有时候被称为解
 
 tstate->interp->eval_frame最终会读取字节码, 然后执行LOAD_NAME, ROT_TWO等字节码对应的过程(这个eval_frame我们可以指向我们自己的函数, 做定制用)
 
-.. code-block:: c
+.. code-block:: c++
 
     switch (opcode) {
         TARGET(LOAD_NAME) {
@@ -73,7 +73,7 @@ tstate->interp->eval_frame最终会读取字节码, 然后执行LOAD_NAME, ROT_T
             }
             PUSH(v);
             DISPATCH();
-        }    
+        }
 
         TARGET(ROT_TWO) {
             PyObject *top = TOP();
@@ -139,11 +139,11 @@ python中变量和对象的关系是称为引用, 可以看成指向关系
         ...:     a.append("aaaaaaaaaaa")
         ...:     return
         ...:
-    
+
     In [52]: x=["x"]
-    
+
     In [53]: test_pass(x)
-    
+
     In [54]: x
     Out[54]: ['x', 'aaaaaaaaaaa']
 
@@ -151,6 +151,182 @@ python中变量和对象的关系是称为引用, 可以看成指向关系
 
 函数结束之后, python解除了a和list对象的引用关系, 而x依然指向list, 所以可以看到x指向的对象被修改了
 
+
+为什么列表解析比for语句快?
+=================================
+
+https://stackoverflow.com/questions/22108488/are-list-comprehensions-and-functional-functions-faster-than-for-loops
+
+.. code-block:: python
+
+    import time
+
+    iter_count = 1000000
+
+    def run_for():
+        x = []
+        for i in range(iter_count):
+            x.append(i)
+        return
+
+    def run_list_comp():
+        x = [i for i in range(iter_count)]
+        return
+
+    def main():
+        s1 = time.time()
+        run_for()
+        s2 = time.time()
+        run_list_comp()
+        s3 = time.time()
+        print(s2 - s1, s3 - s2)
+        return
+
+输出结果 0.09262371063232422, 0.058843135833740234, 显然列表解析比for循环快一点
+
+先看看列表解析的字节码
+
+.. code-block:: python
+
+    In [3]: dis.dis(run_list_comp)
+      2           0 LOAD_CONST               1 (<code object <listcomp> at 0x00000234DD7ECE40, file "<ipython-input-2-a602bd11e5f8>", line 2>)
+                  2 LOAD_CONST               2 ('run_list_comp.<locals>.<listcomp>')
+                  4 MAKE_FUNCTION            0
+                  6 LOAD_GLOBAL              0 (range)
+                  8 LOAD_GLOBAL              1 (iter_count)
+                 10 CALL_FUNCTION            1
+                 12 GET_ITER
+                 14 CALL_FUNCTION            1
+                 16 STORE_FAST               0 (x)
+
+      3          18 LOAD_CONST               0 (None)
+                 20 RETURN_VALUE
+
+显然这里面并没有列表解析的真正过程, 但是注意到有其中会构造一个名为list_comp的函数, 这个函数已经有了codeobject了
+
+然后在第一个CALL_FUNCTION则是调用range函数, 第二个函数就是调用listcomp函数, 所以我们找到这个所谓的listcomp函数
+
+这个listcomp函数的codeobject是在run_list_comp函数种直接拿到的, 那么显然这个codeobject就应该是存储在run_list_comp
+
+但不是run_list_comp本身的codeoobject, 并且加载这个codeobject是调用LOAD_CONST, 那么显然这个codeobject是函数
+
+run_list_comp的const变量, 那么显然这个codeobject就在run_list_comp.__code__.co_consts中了
+
+.. code-block:: python
+
+    In [4]: run_list_comp.__code__.co_consts
+    Out[4]:
+    (None,
+     <code object <listcomp> at 0x00000234DD7ECE40, file "<ipython-input-2-a602bd11e5f8>", line 2>,
+     'run_list_comp.<locals>.<listcomp>')
+
+所以我们再看看这个listcomp的具体字节码是什么
+
+.. code-block:: python
+
+    In [5]: dis.dis(run_list_comp.__code__.co_consts[1])
+      2           0 BUILD_LIST               0
+                  2 LOAD_FAST                0 (.0)
+            >>    4 FOR_ITER                 8 (to 14)
+                  6 STORE_FAST               1 (i)
+                  8 LOAD_FAST                1 (i)
+                 10 LIST_APPEND              2
+                 12 JUMP_ABSOLUTE            4
+            >>   14 RETURN_VALUE
+
+    # 我们对比一下for循环的字节码
+
+    In [9]: dis.dis(run_for)
+      2           0 BUILD_LIST               0
+                  2 STORE_FAST               0 (x)
+
+      3           4 SETUP_LOOP              26 (to 32)
+                  6 LOAD_GLOBAL              0 (range)
+                  8 LOAD_GLOBAL              1 (iter_count)
+                 10 CALL_FUNCTION            1
+                 12 GET_ITER
+            >>   14 FOR_ITER                14 (to 30)
+                 16 STORE_FAST               1 (i)
+
+      4          18 LOAD_FAST                0 (x)
+                 20 LOAD_ATTR                2 (append)
+                 22 LOAD_FAST                1 (i)
+                 24 CALL_FUNCTION            1
+                 26 POP_TOP
+                 28 JUMP_ABSOLUTE           14
+            >>   30 POP_BLOCK
+
+      5     >>   32 LOAD_CONST               0 (None)
+                 34 RETURN_VALUE
+
+所以核心循环的区别就是
+
+.. code-block:: python
+
+    >>    4 FOR_ITER                 8 (to 14)
+          6 STORE_FAST               1 (i)
+          8 LOAD_FAST                1 (i)
+         10 LIST_APPEND              2
+         12 JUMP_ABSOLUTE            4
+    >>   14 RETURN_VALUE
+
+    # 下面是for循环
+    >>   14 FOR_ITER                14 (to 30)
+         16 STORE_FAST               1 (i)
+         18 LOAD_FAST                0 (x)
+         20 LOAD_ATTR                2 (append)
+         22 LOAD_FAST                1 (i)
+         24 CALL_FUNCTION            1
+         26 POP_TOP
+         28 JUMP_ABSOLUTE           14
+    >>   30 POP_BLOCK
+
+列表解析和for循环都有for循环操作(FOR_ITER), 都会调用append函数, 但是区别在于列表解析是直接调用append函数
+
+而for循环的话则是需要先调用LOAD_ATTR取找到append函数, 然后再调用.
+
+**所以for循环比起列表解析多了查询append函数(LOAD_ATTR)以及调用函数(CALL_FUNCTION这个字节码还有很多校验过程)这两个字节码调用, 而列表解析直接调用append函数**
+
+虽然查询append属性(LOAD_ATTR)有缓存, 但是还是有一定的消耗的
+
+在参考链接中用户tjysdsg的回答使用了cProfile库对比了map, reduce, lambda, for, 列表解析的时间性能数据
+
+.. code-block::
+
+    =========================
+    Profiling: list_comp
+    =========================
+             4000000 function calls in 0.737 seconds
+
+       Ordered by: standard name
+
+       ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      1000000    0.318    0.000    0.709    0.000 profiling.py:18(list_comp)
+      1000000    0.261    0.000    0.261    0.000 profiling.py:19(<listcomp>)
+      1000000    0.131    0.000    0.131    0.000 {built-in method builtins.sum}
+      1000000    0.027    0.000    0.027    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+
+    =========================
+    Profiling: for_loop
+    =========================
+           11000000 function calls in 1.372 seconds
+
+     Ordered by: standard name
+
+     ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+    1000000    0.879    0.000    1.344    0.000 profiling.py:7(for_loop)
+    1000000    0.145    0.000    0.145    0.000 {built-in method builtins.sum}
+    8000000    0.320    0.000    0.320    0.000 {method 'append' of 'list' objects}
+    1000000    0.027    0.000    0.027    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+
+
+for循环中, 寻找函数和调用函数的次数非常多, 导致LOAD_ATTR和CALL_FUNCTION这两个字节码被频繁调用
+
+我们看到append这个函数调用(也就死LOAD_ATTR和CALL_FUNCTION这两个字节码)了8000000次, 其中8是元素个数
+
+而在列表解析中, 虽然也会调用8000000次(8是元素个数, 每次listcomp都会调用8次LIST_APPEND)LIST_APPEND这个函数, 但是在由于省去了LOAD_ATTR和CALL_FUNCTION的开销
+
+**所以总结起来就是python的函数查询/调用也会消耗一定的时间, 当次数多了之后时间消耗就比较明显**
 
 多核并行
 ==============
@@ -165,7 +341,7 @@ CPython的线程是系统线程的一个包装, 调度上还是依赖于操作�
 compile
 ============
 
-compile.rst
+**compile.rst**
 
 code object? frame object?
 
@@ -174,7 +350,7 @@ exec和eval有什么区别?
 class
 =============================
 
-class_xxx.rst
+**class_xxx.rst**
 
 type为什么既可以传入1个参数也可以传入3个参数?
 
@@ -188,7 +364,7 @@ type和类是什么关系?
 GC
 ========
 
-gc.rst
+**gc.rst**
 
 为什么调用sys.getrefcount得到的引用计数不对?
 
@@ -200,7 +376,7 @@ gc.rst
 thread
 ====================
 
-thread.rst
+**thread.rst**
 
 能不能手动终止线程?
 
@@ -208,16 +384,27 @@ thread.rst
 GIL
 =======
 
-gil.rst
+**gil.rst**
 
 护航效应?
 
+
+async
+==========
+
+**coroutine_and_async.rst**
+
+为什么可迭代对象还需要一个迭代器对象?
+
+生成器对象如何工作的?
+
+协程是什么? EventLoop的流程大概是什么?
 
 
 memory management
 ======================
 
-memory_management.rst
+**memory_management.rst**
 
 内置对象都有预分配的缓存池
 

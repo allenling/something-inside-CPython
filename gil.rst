@@ -20,7 +20,7 @@ variable (gil_cond). gil_mutex is taken for short periods of time, and therefore
 
 显然GIL只是一个真假值, 访问它需要获取锁, 并且修改该值之后会通过Condtion来通知其他线程, 而其他线程获取到GIl之后会通知当前释放GIl的线程
 
-.. code-block:: c
+.. code-block:: c++
 
     // 这个就是GIl了
     static _Py_atomic_int gil_locked = {-1};
@@ -29,7 +29,7 @@ variable (gil_cond). gil_mutex is taken for short periods of time, and therefore
 
 只有修改gil_locked的时候才需要锁而读取该值是不需要锁的, 切换gil的时候, 获取gil的线程会设置gil_last_holder为自己线程的tstate结构
 
-.. code-block:: c
+.. code-block:: c++
 
     static COND_T gil_cond;
     static MUTEX_T gil_mutex;
@@ -50,7 +50,7 @@ gil_mutext就是访问gil_locked之前必须要拿到的锁, 而gil_cond和gil_m
 
 强行释放gil. 所以只有一个线程的话, 并不会发生gil切换, 如果有线程进入, 那么另外一个线程至少能运行5ms(当然是该线程不会进入IO), 这个5ms是可以设置的
 
-.. code-block:: c
+.. code-block:: c++
 
     static void take_gil(PyThreadState *tstate)
     {
@@ -89,7 +89,7 @@ gil_mutext就是访问gil_locked之前必须要拿到的锁, 而gil_cond和gil_m
 
 释放gil很简单, 把gil_locked设置为0, 然后通知其他线程可以抢锁了
 
-.. code-block:: c
+.. code-block:: c++
 
     static void drop_gil(PyThreadState *tstate)
     {
@@ -119,7 +119,7 @@ gil_mutext就是访问gil_locked之前必须要拿到的锁, 而gil_cond和gil_m
 
 而判断什么时候需要take_gil, drop_gil是在解释器执行字节码的之前判断的
 
-.. code-blocl:: c
+.. code-block:: c++
 
     // 默认执行字节码的程序
     PyObject *
@@ -128,33 +128,45 @@ gil_mutext就是访问gil_locked之前必须要拿到的锁, 而gil_cond和gil_m
         // 执行字节码之前判断一下是否需要处理中断
         for (;;) {
         
-            // gil_drop_request为1表示有线程要求释放gil
-            if (_Py_atomic_load_relaxed(&gil_drop_request)) {
-                if (PyThreadState_Swap(NULL) != tstate)
-                    Py_FatalError("ceval: tstate mix-up");
-                // 那么我们就释放gil
-                drop_gil(tstate);
+            // eval_breaker表示有中断
+            if (_Py_atomic_load_relaxed(&eval_breaker)) {
+                // 下面查看中断类型
 
-                // 同时再次获取gil
-                take_gil(tstate); 
-
-                if (_Py_Finalizing && _Py_Finalizing != tstate) {
-                    drop_gil(tstate);
-                    PyThread_exit_thread();
+                // 有系统信号要处理
+                if (_Py_atomic_load_relaxed(&pendingcalls_to_do)) {
+                    if (Py_MakePendingCalls() < 0)
+                        goto error;
                 }
 
-                if (PyThreadState_Swap(tstate) != NULL)
-                    Py_FatalError("ceval: orphan tstate");
+
+                // gil_drop_request为1表示有线程要求释放gil
+                if (_Py_atomic_load_relaxed(&gil_drop_request)) {
+                    if (PyThreadState_Swap(NULL) != tstate)
+                        Py_FatalError("ceval: tstate mix-up");
+                    // 那么我们就释放gil
+                    drop_gil(tstate);
+
+                    // 同时再次获取gil
+                    take_gil(tstate); 
+
+                    if (_Py_Finalizing && _Py_Finalizing != tstate) {
+                        drop_gil(tstate);
+                        PyThread_exit_thread();
+                    }
+
+                    if (PyThreadState_Swap(tstate) != NULL)
+                        Py_FatalError("ceval: orphan tstate");
+                }
+
+                // 有异常要处理
+                if (tstate->async_exc != NULL) {
+                }
             }
-        
+            // 执行字节码
+
+            switch(opcode){
+            }
         }
-        
-        // 执行字节码
-        switch(opcode){
-        
-        }
-    
-    
     }
 
 FORCE SWITCH
@@ -167,7 +179,7 @@ FORCE SWITCH
 之后drop_gil才完成
 
 
-.. code-block:: c
+.. code-block:: c++
 
     static void drop_gil(PyThreadState *tstate)
     {
@@ -200,7 +212,7 @@ FORCE_SWITCHING模式在CPython中是默认打开的, 然后释放完gil之后�
 
 在take_gil的时候通知释放gil的线程说自己已经被调度了
 
-.. code-block:: c
+.. code-block:: c++
 
     static void take_gil(PyThreadState *tstate)
     {
@@ -243,7 +255,7 @@ FORCE_SWITCHING模式在CPython中是默认打开的, 然后释放完gil之后�
 
 在CPython中很多IO操作都主动释放了GIL, 比如sleep
 
-.. code-block:: c
+.. code-block:: c++
 
     static int
     pysleep(_PyTime_t secs)
@@ -255,23 +267,18 @@ FORCE_SWITCHING模式在CPython中是默认打开的, 然后释放完gil之后�
     #else
     // 这里是windows平台的变量定义
     #endif
-    
         deadline = _PyTime_GetMonotonicClock() + secs;
-    
         do {
     #ifndef MS_WINDOWS
             if (_PyTime_AsTimeval(secs, &timeout, _PyTime_ROUND_CEILING) < 0)
                 return -1;
-    
             // 下面两个包裹着select的宏是先释放gil然后获取gil
             Py_BEGIN_ALLOW_THREADS
             // select系统调用
             err = select(0, (fd_set *)0, (fd_set *)0, (fd_set *)0, &timeout);
             Py_END_ALLOW_THREADS
-    
             if (err == 0)
                 break;
-    
             if (errno != EINTR) {
                 PyErr_SetFromErrno(PyExc_OSError);
                 return -1;
@@ -279,24 +286,21 @@ FORCE_SWITCHING模式在CPython中是默认打开的, 然后释放完gil之后�
     #else
     // 里面是windows平台的处理
     #endif
-    
             /* sleep was interrupted by SIGINT */
             if (PyErr_CheckSignals())
                 return -1;
-    
             monotonic = _PyTime_GetMonotonicClock();
             secs = deadline - monotonic;
             if (secs < 0)
                 break;
             /* retry with the recomputed delay */
         } while (1);
-    
         return 0;
     }
 
 CPython中提供了两个宏操作Py_BEGIN_ALLOW_THREADS和Py_END_ALLOW_THREADS, 前者是释放GIL而后者是获取GIL, 两者之间的代码块就不受GIL影响了
 
-.. code-block:: c
+.. code-block:: c++
 
     #define Py_BEGIN_ALLOW_THREADS { \
                             PyThreadState *_save; \
