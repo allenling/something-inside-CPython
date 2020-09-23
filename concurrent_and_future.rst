@@ -426,14 +426,15 @@ ProcessPoolExecutor先启动多个multiprocessing.Process作为worker, 以及两
           put                                            |
       把obj存储到                                        |
            |                                             |
-           ------>----- 存储待发送内容的buffer -->    从bufer中拿到obj  --然后通过单向pipe发送---> pipe --->
+           ------>----- 存储待发送内容的buffer -->    从bufer中拿到obj           --通过单向pipe发送bytes---> pipe --->
+                                                       pickle拿到的obj为bytes
 
 
+而multiprocess.SimpleQueue和multiprocess.Queue的区别在于SimpleQueue, **SimpleQueue只是一个读加锁写不加锁, 并且没有容量的, 同步的单向pipe的包装**:
 
-而multiprocess.SimpleQueue和multiprocess.Queue的区别在于SimpleQueue, SimpleQueue只是一个同步的读加锁写不加锁的单向pipe
+*Simplified Queue type -- really just a locked pipe*
 
-在代码注释中提到 *Simplified Queue type -- really just a locked pipe*
+所以在ProcessPoolExecutor中, result_queue是一个SimpleQueue, 这样主进程和worker进程都可以向result_queue写入, 因为没有容量的限制, 允许多个进程写入
 
-
-所以在ProcessPoolExecutor中, result_queue是一个SimpleQueue, 这样主进程和worker进程都可以向result_queue写入
+而读取是需要加锁的, 因为在接收端可以是多个线程读. 同时SimpleQueue是同步的, 也就是SimpleQueue没有发送线程, 当调用put的时候会等待pipe的发送结束.
 
