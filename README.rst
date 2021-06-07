@@ -120,6 +120,37 @@ tstate->interp->eval_frame最终会读取字节码, 然后执行LOAD_NAME, ROT_T
 
 4. 最后调用STORE_NAME来调整a和b指向的值, 首先STORE_NAME(1)则是拿到变量名a, 然后弹出栈顶的值, 也就是vb, 然后进行赋值, 此时a就指向vb, 同理, b就指向了ba, 交换完成
 
+.. code-block:: python
+
+    '''
+    局部变量名数组 [b,   a]
+    局部变量数组   [vb, va]
+    
+    1. LOAD_NAME(0), 也就是取出vb, 入栈, 此时
+
+       --栈顶  vb
+       
+    2. LOAD_NAME(1), 取出va, 入栈
+
+       --栈顶 va
+              vb
+              
+    3. ROT_TWO, 交换两者
+
+       --栈顶 va          --栈顶 vb
+              vb   ====>        va
+            
+     4. STORE_NAME, 重新赋值, STORE_NAME(1), 1表示a在局部变量名数组的下标, 所以这里表示把变量名a指向栈顶元素, 所以先把栈顶元素出栈
+     
+        --栈顶 vb                   --栈顶 va
+               va    ===弹出vb====>             =>  a->vb
+                      
+     5. 同理STORE_NAME(0)表示b指向栈顶元素
+ 
+        --栈顶 va                  --栈顶 
+                    ===弹出va==>             =>  b->va
+                    
+    '''
 引用
 ===========
 
