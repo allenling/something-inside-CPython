@@ -5,7 +5,7 @@ concurrent
 Future
 =============
 
-一个函数(可执行对象)执行的时候是同步的, 也可以是异步的. 异步执行的时候经常就把该函数交给某个线程去执行
+一个函数(可执行对象)执行的时候是同步的, 也可以是异步的. 异步执行的时候经常就把该函数交给某个线程/进程去执行
 
 但是这个函数执行完只会的结果我们怎么去获取呢? 我们可以使用queue, 同步机制等等, **Future对象同样是为了帮助我们获取这些异步执行的结果**
 
@@ -23,17 +23,16 @@ Future
         executor = ThreadPoolExecutor(max_workers=2)
         a = executor.submit(wait_on_a)
         print(a._state)
-        time.sleep(3)
+        print(a.result(timeout=3))
         print(a._state)
-        print(a._result)
         return
 
     if __name__ == "__main__":
         main()
 
-这里我们把wait_on_a发送到线程池中运行, 那么运行就是异步的. 异步执行的函数我们无法直接感知其执行状态的但是每个异步函数都和一个Future对象一一对应起来
+这里我们把wait_on_a发送到线程池中运行, 那么运行就是异步的. 异步执行的函数我们无法直接感知其执行状态的, 但是我们可以把每个异步函数都和一个Future对象一一对应起来
 
-那么我们可以检查其对应的Future对象的状态Future的状态就是函数执行的状态, 如果Future的状态是正常结束, 那么Future._result就是函数的返回值
+那么我们可以检查其对应的Future对象的状态Future的状态就是函数执行的状态
 
 例子中输出为
 
@@ -41,16 +40,109 @@ Future
 
    RUNNING
    going to return
-   FINISHED
    6
+   FINISHED
 
-Future一开始的状态是RUNNING, 表示函数依然在运行中, 而之后状态变为了FINISHED, 同时Future._result就是函数返回值
+Future第一次打印的时候状态是RUNNING, 表示函数依然在运行中, 而之后状态变为了FINISHED, 同时Future.result调用返回的就是函数返回值
 
-**Future是表示异步执行的结果的对象, 当Future的状态变为完成, 取消, 异常的时候. 表示异步执行的结果同样是完成, 取消和异常**
+**Future是表示异步可执行的状态和对象**. Future就和执行单位(Thread/Process)剥离出来了, 作为一个单独的组件, 但是其状态代表的则是分配给它的可执行对象的状态
 
-这样对于异步执行的程序, 线程池中的worker线程执行完成之后, 设置Future对象的状态和结果, 而另外一个线程通过在同一个Future对象上进行检查就可以知道异步执行的结果了
+所以如果谈到Future, 其实也是指对应的可执行对象
 
-你可以对一个Future对象调用set_result, 表示设置Future的状态为FINISHED, 同时设置上函数返回值
+Future._state
+==================
+
+一个Future的状态有下面几个
+
+.. code-block:: python
+
+    # Possible future states (for internal use by the futures package).
+    PENDING = 'PENDING'
+    RUNNING = 'RUNNING'
+    # The future was cancelled by the user...
+    CANCELLED = 'CANCELLED'
+    # ...and _Waiter.add_cancelled() was called by a worker.
+    CANCELLED_AND_NOTIFIED = 'CANCELLED_AND_NOTIFIED'
+    FINISHED = 'FINISHED'
+
+    _FUTURE_STATES = [
+        PENDING,
+        RUNNING,
+        CANCELLED,
+        CANCELLED_AND_NOTIFIED,
+        FINISHED
+    ]
+
+PENDING是初始状态, 在Future.__init__中Future._state被初始化为PENDING
+
+RUNNING状态是在Executor执行Future对应的可执行对象的时候设置的, RUNNING只能是从PENDING状态转移过来, 只能通过调用set_running_or_notify_cancel方法来设置
+
+.. code-block:: python
+
+    def set_running_or_notify_cancel(self):
+        """Mark the future as running or process any cancel notifications.
+
+        Should only be used by Executor implementations and unit tests.
+
+        If the future has been cancelled (cancel() was called and returned
+        True) then any threads waiting on the future completing (though calls
+        to as_completed() or wait()) are notified and False is returned.
+
+        If the future was not cancelled then it is put in the running state
+        (future calls to running() will return True) and True is returned.
+
+        This method should be called by Executor implementations before
+        executing the work associated with this future. If this method returns
+        False then the work should not be executed.
+
+        Returns:
+            False if the Future was cancelled, True otherwise.
+
+        Raises:
+            RuntimeError: if this method was already called or if set_result()
+                or set_exception() was called.
+        """
+        with self._condition:
+            if self._state == CANCELLED:
+                self._state = CANCELLED_AND_NOTIFIED
+                for waiter in self._waiters:
+                    waiter.add_cancelled(self)
+                # self._condition.notify_all() is not necessary because
+                # self.cancel() triggers a notification.
+                return False
+            elif self._state == PENDING:
+                # 如果Future为PENDING状态, 那么设置为RUNNING状态
+                self._state = RUNNING
+                return True
+            else:
+                LOGGER.critical('Future %s in unexpected state: %s',
+                                id(self),
+                                self._state)
+                raise RuntimeError('Future in unexpected state')
+
+通过注释可知, 能把一个Future对象设置为RUNNING状态的应该只能是Executor, 在这里提供了ThreadPoolExecutor和ProcessPoolExecutor两种执行者
+
+比如在ThreadPoolExecutor, 一个WorkItem被执行的是调用set_running_or_notify_cancel去设置Future的状态为RUNNING
+
+.. code-block:: python
+
+    class _WorkItem(object):
+        def run(self):
+            if not self.future.set_running_or_notify_cancel():
+                return
+
+            # 在当前线程中执行可执行对象fn
+            # 当前线程和submit线程不一样
+            try:
+                result = self.fn(*self.args, **self.kwargs)
+            except BaseException as e:
+                # 设置异常
+                self.future.set_exception(e)
+            else:
+                # 否则设置结果
+                self.future.set_result(result)
+
+而FINISHED状态则是表示可执行对象已经结束, 此时可能是成功或者异常, 调用set_result来设置返回值, 或者调用set_exception来设置发生的异常
 
 .. code-block:: python
 
@@ -76,175 +168,201 @@ Future一开始的状态是RUNNING, 表示函数依然在运行中, 而之后状
             self._condition.notify_all()
         self._invoke_callbacks()
 
-因为Future对象会被多个线程操作的, 所以使用self._condition这样一个threading.Condition给保护起来, 然后设置self._result和self._state
+CANCELLED和CANCELLED_AND_NOTIFIED都是表示Future是否被取消.
 
-当异步执行的函数出现异常的时候, 同样有Future.set_exception方法去调用, 过程都是类似的, 设置self._result和self._state
+**取消操作只能是在Future没有执行, 也就是处于PENDING状态的时候执行, 一旦Future为RUNNING状态之后, 就不能取消了**
 
-如果我们希望等待Future执行完成的话, Future.result方法会在指定的timeout时间等待Future._state被设置为FINISHED
+.. code-block:: python
+
+    def cancel(self):
+        """Cancel the future if possible.
+
+        Returns True if the future was cancelled, False otherwise. A future
+        cannot be cancelled if it is running or has already completed.
+        """
+        with self._condition:
+            # 如果为RUNNING或者FINISHED, 那么返回False, 表示Future没有取消
+            if self._state in [RUNNING, FINISHED]:
+                return False
+
+            # 如果早已取消, 那么返回True, 表示Future早已取消
+            if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
+                return True
+
+            # 这里只有_state为PENDING才能走到
+            self._state = CANCELLED
+            self._condition.notify_all()
+
+        self._invoke_callbacks()
+        return True
+
+所以状态转移就是
+
+.. code-block:: 
+
+    PENDING -> RUNNING -> FINISHED
+
+            -> CANCELLED/CANCELLED_AND_NOTIFIED
+
+为什么无法取消Future(可执行对象)
+==================================
+
+**为什么不能取消Future(或者说异步执行对象)? 那是因为你无法通知可执行对象终止.**
+
+比如线程, 在操作系统级别有中断, 在Python提供的ThreadException, 但是这些都是在指令级别上的操作, 前者是检查CPU指令, 后者是检查字节码, 同时后者必须执行到下一个字节码的时候才会去
+
+查询是否需要终止线程, 如果你在某个字节码上阻塞住了(比如time.sleep), 那么你依然无法终止线程.
+
+所以如果你不能在指令级别上进行操作, 那么你无法终止一个可执行对象. 比如一个函数一直加1, 你如何终止呢?
+
+一般我们需要在可执行对象上查看某些状态来判断我们是否需要退出, 比如使用nonblock模式去读取一个queue, 如果没有得到终止指令, 那么就继续执行, 否则退出
+
+.. code-block:: python
+
+    while True:
+        try:
+            cmd = cmd_queue.get(block=False)
+        except Empty:
+            # run your code
+            pass
+        else:
+            if cmd == "quit":
+                return
+
+又比如C++中的boost的thread库提供interruption_point, 每次线程执行到interruption_point的时候回去检查是否需要退出, 这个和python的方法一样.
+
+**所以, 网络操作一定要记得加上timeout!**
+
+Future.result/Future.exception
+=====================================
+
+因为Future对象会被多个线程操作的, 所以使用Future._condition这样一个threading.Condition给保护起来
+
+调用Future.result则等待Future执行完成然后获取返回值, 在timeout时间等待Future._state被设置为FINISHED, 注意如果是发生了异常, 那么Future.result则会引发异常
 
 .. code-block:: python
 
     def result(self, timeout=None):
         # 先获取self._condition
         with self._condition:
-            # 如果self._state不为FINISHED, 那么引发异常
+            # 如果被取消, 那么引发异常
             if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
                 raise CancelledError()
             elif self._state == FINISHED:
-                # 否则返回结果
+                # 如果早就终止了, 那么返回结果
                 return self.__get_result()
 
-            # 否则说明异步函数还在执行, 那么在self._condition上等待被其他线程唤醒
+            # 否则说明异步函数要么是PENDING, 要么是RUNNING, 那么在self._condition上等待被其他线程唤醒
             self._condition.wait(timeout)
 
-            # 被唤醒说明异步执行有结果了, 校验结果
+            # 如果此时是CANCELLED状态, 说明之前是PENDING状态
             if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
                 raise CancelledError()
             elif self._state == FINISHED:
+                # 否则之前是RUNNING状态, 那么获取结果返回
                 return self.__get_result()
             else:
+                # 否则依然在PENDING或者RUNNING状态, 那么就超时了
                 raise TimeoutError()
 
 
-Future对象经常在async io中使用, async io基于事件机制的(底层基于操作的事件通知机制), async io中的任务(需要执行的函数)遇到io操作的时候
+    def __get_result(self):
+        if self._exception:
+            # 如果执行有异常, 那么引发异常
+            raise self._exception
+        else:
+            # 否则返回结果
+            return self._result
 
-是将操作交给其他worker来执行(比如线程worker), 自己则让出EventLoop的时间片, 等待结果完成. 那么EventLoop需要一个对象, 能通过这个对象获取异步
-
-执行的状态和结果, 同时支持超时机制, 那么这个对象就是Future
-
-waiters
+wait
 ==========
 
-对于一些列的Future对象, 如果希望每次有Future完成的话就返回这个完成的Future, concurrent提供了as_completed函数可以实现这个需求
+Future显然是一个可等待对象(自创), 对于一些Future对象, 有时候希望每次有Future完成的话就返回这个完成的Future, 或则只要有某个出现异常, 就返回这样的需求, concurrent也提供了这些功能
 
-as_completed中思路创建waiter, 该waiter在Future上进行等待, 一旦有Future状态变化, 比如被调用set_result设置状态为FINISHED, 那么Future就会通知waiter
+concurrent中wait函数提供了不同的需求的支持, 包括
 
-waiter一旦知道Future的状态变化之后, 根据需要通知等待者. 比如as_completed中的waiter会在每一个Future对象状态变为FINISHED的时候通知调用者
+1. as_completed, 即只要某些future的状态变为FINISHED, 那么返回, 然后继续在未结束的future上等待
 
-.. code-block:: python
+2. first_completed, 当第一个future变为FINISHED的时候, 返回, 同时不会在其他future上等待了
 
-    def as_completed(fs, timeout=None):
-        if timeout is not None:
-            end_time = timeout + time.time()
+3. all_completed, 等待所有的future都FINISHED之后才返回
 
-        fs = set(fs)
-        # 这里是for循环去拿住所有Future._condition
-        with _AcquireFutures(fs):
-            finished = set(
-                    f for f in fs
-                    if f._state in [CANCELLED_AND_NOTIFIED, FINISHED])
-            # 把已经FINISHED的Future给放到finished集合中
-            # 注意finished是集合而不是列表, 所以返回给调用者的Future不是有序的
-            pending = fs - finished
-            # 在Future上进行等待
-            waiter = _create_and_install_waiters(fs, _AS_COMPLETED)
+4. first_exception, 等待第一个future状态为FINISHED, 同时其Future._exception不为空的话, 返回, 并且终止等待其他future
 
-        try:
-            # 如果已经有Future完成了, 直接返回不需要等待
-            yield from finished
+这里最基础的功能就是需要Future对象在状态变更的时候, 提供通知机制, 所以在Future中使用了condition来通知状态变更
 
-            while pending:
-                if timeout is None:
-                    wait_timeout = None
-                else:
-                    wait_timeout = end_time - time.time()
-                    if wait_timeout < 0:
-                        raise TimeoutError(
-                                '%d (of %d) futures unfinished' % (
-                                len(pending), len(fs)))
+Future._waiters
+--------------------
 
-                # 否则在waiter上(waiter.event)上等待
-                waiter.event.wait(wait_timeout)
+虽然Future中使用condition来限制多线程的操作, 但是这里Future._waiters却不是Future._condition的waiters, Future._condition是Threading.Condition, Condition和Condition._waiters其参考其他
 
-                # 一旦waiter.event返回了, 表示肯定有Future已经FINISHED了
-                with waiter.lock:
-                    # 拿到FINISHED列表
-                    finished = waiter.finished_futures
-                    # 清空waiter.finished_futures
-                    waiter.finished_futures = []
-                    # 重置waiter.event
-                    waiter.event.clear()
+这里Future._waiters则是说等待该Future状态变化, 而不参与Future._condition的竞争(毕竟Future._condition是内部使用的, Future._waiters是通知外部的)
 
-                for future in finished:
-                    # 把完成的future给yield出去
-                    yield future
-                    pending.remove(future)
-
-        finally:
-            for f in fs:
-                with f._condition:
-                    f._waiters.remove(waiter)
-
-这里关键在于waiter说明时候唤醒waiter.event, 首先, 我们可以选择Future处于什么状态的时候通知我们, 比如上面的例子中就是当Future为FINISHED的时候
-
-把FINISHED的Future返回给我们. 根据这个需求有不同的waiter, 上面的例子中waiter就是_AsCompletedWaiter
+比如调用Future.set_result就把状态设置为FINISHED, 则Future就通知Future._waiters了
 
 .. code-block:: python
 
-    def _create_and_install_waiters(fs, return_when):
-        if return_when == _AS_COMPLETED:
-            # 根据传入的_AS_COMPLETED, 创建一个_AsCompletedWaiter
-            waiter = _AsCompletedWaiter()
-        elif return_when == FIRST_COMPLETED:
-            waiter = _FirstCompletedWaiter()
-        else:
-            pending_count = sum(
-                    f._state not in [CANCELLED_AND_NOTIFIED, FINISHED] for f in fs)
+    def set_result(self, result):
+        """Sets the return value of work associated with the future.
 
-            if return_when == FIRST_EXCEPTION:
-                waiter = _AllCompletedWaiter(pending_count, stop_on_exception=True)
-            elif return_when == ALL_COMPLETED:
-                waiter = _AllCompletedWaiter(pending_count, stop_on_exception=False)
-            else:
-                raise ValueError("Invalid return condition: %r" % return_when)
+        Should only be used by Executor implementations and unit tests.
+        """
+        with self._condition:
+            self._result = result
+            self._state = FINISHED
+            # 通知Future._waiters
+            for waiter in self._waiters:
+                waiter.add_result(self)
+            self._condition.notify_all()
+        self._invoke_callbacks()
 
-        # 把这个waiter传入到所有的Future._waiters列表中
-        for f in fs:
-            f._waiters.append(waiter)
+所以waiter要实现add_result方法, 不仅仅是add_result, 还有其他方法, 包括add_exception, add_cancelled, 你也可以实现自己的Waiter, 但是至少要实现这3个方法
 
-        return waiter
-
-这里关键在于把waiter传入到Future._waiters列表中, 那么在Future表为FINISHED的时候, 会调用Future._waiters中所有的waiter的add_result方法
+这3个方法分别是在状态变更的时候被调用
 
 .. code-block:: python
-
-    class Future(object):
-        def set_result(self, result):
-            with self._condition:
-                self._result = result
-                self._state = FINISHED
-                # 调用所有waiters的add_result
-                for waiter in self._waiters:
-                    waiter.add_result(self)
-                self._condition.notify_all()
-            self._invoke_callbacks()
 
     class _Waiter(object):
         """Provides the event that wait() and as_completed() block on."""
         def __init__(self):
             self.event = threading.Event()
             self.finished_futures = []
-
+    
         def add_result(self, future):
             self.finished_futures.append(future)
+    
+        def add_exception(self, future):
+            self.finished_futures.append(future)
+    
+        def add_cancelled(self, future):
+            self.finished_futures.append(future)
 
-    class _AsCompletedWaiter(_Waiter):
-        """Used by as_completed()."""
 
-        def __init__(self):
-            super(_AsCompletedWaiter, self).__init__()
-            self.lock = threading.Lock()
+**所以Future只告诉你我状态变更了, 而什么时候通知用户, 是waiter自己根据需要来实现的**
 
+
+比如我们只需要第一个状态变为FINISHED的future, 那么我们可以这样
+
+.. code-block:: python
+
+    class _FirstCompletedWaiter(_Waiter):
+        """Used by wait(return_when=FIRST_COMPLETED)."""
+    
         def add_result(self, future):
-            with self.lock:
-                super(_AsCompletedWaiter, self).add_result(future)
-                self.event.set()
+            super().add_result(future)
+            self.event.set()
+    
+        def add_exception(self, future):
+            super().add_exception(future)
+            self.event.set()
+    
+        def add_cancelled(self, future):
+            super().add_cancelled(future)
+            self.event.set()
 
-每次_AsCompletedWaiter.add_result则是把已完成的Future加入到self.finished_futures列表, 然后调用self.event
+只要有Future调用了set_result, 那么就会调用_FirstCompletedWaiter.add_result, 那么直接就通过self.event.set来通知上一层
 
-所以每次有Future完成, 那么_AsCompletedWaiter总是通知as_completed去获取finished_futures, 而对于_AllCompletedWaiter这个waiter
-
-总是在所有的Future都完成之后才会通知self.event
+如果我们需要所有的Future都FINISHED了才通知上一层, 那么可以有
 
 .. code-block:: python
 
@@ -259,21 +377,181 @@ waiter一旦知道Future的状态变化之后, 根据需要通知等待者. 比�
     
         def _decrement_pending_calls(self):
             with self.lock:
-                # 这个self.num_pending_calls就是等待完成的Future个数
+                # 计算还有多少个Future没有FINISHED
                 self.num_pending_calls -= 1
                 if not self.num_pending_calls:
-                    # 当所有的Future都FINISHED之后, 才会去设置self.event
+                    # 如果没有, 那么通知上一层
                     self.event.set()
     
         def add_result(self, future):
             super().add_result(future)
             self._decrement_pending_calls()
 
+first_completed, first_exception, all_completed都是在concurrent.future.wait这个函数中支持的
+
+.. code-block:: python
+
+    def wait(fs, timeout=None, return_when=ALL_COMPLETED):
+        """Wait for the futures in the given sequence to complete.
+    
+        Args:
+            fs: The sequence of Futures (possibly created by different Executors) to
+                wait upon.
+            timeout: The maximum number of seconds to wait. If None, then there
+                is no limit on the wait time.
+            return_when: Indicates when this function should return. The options
+                are:
+    
+                FIRST_COMPLETED - Return when any future finishes or is
+                                  cancelled.
+                FIRST_EXCEPTION - Return when any future finishes by raising an
+                                  exception. If no future raises an exception
+                                  then it is equivalent to ALL_COMPLETED.
+                ALL_COMPLETED -   Return when all futures finish or are cancelled.
+    
+        Returns:
+            A named 2-tuple of sets. The first set, named 'done', contains the
+            futures that completed (is finished or cancelled) before the wait
+            completed. The second set, named 'not_done', contains uncompleted
+            futures.
+        """
+        with _AcquireFutures(fs):
+            done = set(f for f in fs
+                       if f._state in [CANCELLED_AND_NOTIFIED, FINISHED])
+            not_done = set(fs) - done
+    
+            if (return_when == FIRST_COMPLETED) and done:
+                return DoneAndNotDoneFutures(done, not_done)
+            elif (return_when == FIRST_EXCEPTION) and done:
+                if any(f for f in done
+                       if not f.cancelled() and f.exception() is not None):
+                    return DoneAndNotDoneFutures(done, not_done)
+    
+            if len(done) == len(fs):
+                return DoneAndNotDoneFutures(done, not_done)
+    
+            # 根据类型创建不同的waiter
+            waiter = _create_and_install_waiters(fs, return_when)
+    
+        # 在waiter上的event等待
+        waiter.event.wait(timeout)
+        # 返回就移除waiter
+        for f in fs:
+            with f._condition:
+                f._waiters.remove(waiter)
+    
+        done.update(waiter.finished_futures)
+        return DoneAndNotDoneFutures(done, set(fs) - done)
+
+
+    def _create_and_install_waiters(fs, return_when):
+        # 根据不同的类型状态不同的waiter对象
+        if return_when == _AS_COMPLETED:
+            waiter = _AsCompletedWaiter()
+        elif return_when == FIRST_COMPLETED:
+            waiter = _FirstCompletedWaiter()
+        else:
+            pending_count = sum(
+                    f._state not in [CANCELLED_AND_NOTIFIED, FINISHED] for f in fs)
+    
+            if return_when == FIRST_EXCEPTION:
+                waiter = _AllCompletedWaiter(pending_count, stop_on_exception=True)
+            elif return_when == ALL_COMPLETED:
+                waiter = _AllCompletedWaiter(pending_count, stop_on_exception=False)
+            else:
+                raise ValueError("Invalid return condition: %r" % return_when)
+    
+        # 这里!!!!!!
+        # 把waiter加入到Future._waiters中
+        for f in fs:
+            f._waiters.append(waiter)
+    
+        return waiter
+
+这3个的共同点就是只会等待一次, 要么第一个Future状态变化就返回, 要么所有的Future都FINISHED只会才返回, 而as_complted则需要持续等待
+
+
+as_completed
+------------------
+
+既然as_completed需要在状态未变化的Future上继续等待, 那么我们就需要重置waiter.event了, 要重置event, 就需要lock去保护, 所以为什么
+
+_AsCompletedWaiter上带了个lock的原因, 比如在我们重置event的时候, 在重置finished_futures列表之前, 剩下的future都完成了
+
+那么我们此时把finished_futures重置为空列表, 那么如果继续在该event上等待的话, 不加超时就永远不会返回了
+
+.. code-block:: python
+
+    def as_completed(fs, timeout=None):
+        """An iterator over the given futures that yields each as it completes.
+    
+        Args:
+            fs: The sequence of Futures (possibly created by different Executors) to
+                iterate over.
+            timeout: The maximum number of seconds to wait. If None, then there
+                is no limit on the wait time.
+    
+        Returns:
+            An iterator that yields the given Futures as they complete (finished or
+            cancelled). If any given Futures are duplicated, they will be returned
+            once.
+    
+        Raises:
+            TimeoutError: If the entire result iterator could not be generated
+                before the given timeout.
+        """
+        if timeout is not None:
+            end_time = timeout + time.time()
+    
+        fs = set(fs)
+        with _AcquireFutures(fs):
+            finished = set(
+                    f for f in fs
+                    if f._state in [CANCELLED_AND_NOTIFIED, FINISHED])
+            pending = fs - finished
+            waiter = _create_and_install_waiters(fs, _AS_COMPLETED)
+        
+        # 上面的流程依然是创建waiter
+        # 然后先计算一下当前已经完成的Future
+    
+        try:
+            # 返回一开始就完成的Future
+            yield from finished
+    
+            while pending:
+                if timeout is None:
+                    wait_timeout = None
+                else:
+                    wait_timeout = end_time - time.time()
+                    if wait_timeout < 0:
+                        raise TimeoutError(
+                                '%d (of %d) futures unfinished' % (
+                                len(pending), len(fs)))
+    
+                # 在waiter.event上等待
+                waiter.event.wait(wait_timeout)
+    
+                # 抢锁, 防止我们无法返回
+                # 重置event, 继续等待未完成的Future!!!!!!!!!!!!!!!!!!!!
+                with waiter.lock:
+                    finished = waiter.finished_futures
+                    waiter.finished_futures = []
+                    waiter.event.clear()
+    
+                for future in finished:
+                    yield future
+                    pending.remove(future)
+    
+        finally:
+            for f in fs:
+                with f._condition:
+                    f._waiters.remove(waiter)
+
 
 ThreadPoolExecutor
 ========================
 
-线程池就是利用了Future来追踪调用状态的
+线程池创建多个threading.Thread来执行可执行对象, 通过queue.Queue来传递要执行的可执行对象, 使用Future来通知用户
 
 .. code-block:: python
 
@@ -332,7 +610,7 @@ ThreadPoolExecutor
                 # 一直从work_queue中获取_WorkItem
                 work_item = work_queue.get(block=True)
                 if work_item is not None:
-                    执行_WorkItem.run
+                    # 执行_WorkItem.run
                     work_item.run()
                     # Delete references to object. See issue16284
                     del work_item
@@ -379,62 +657,281 @@ ThreadPoolExecutor
 ProcessPoolExecutor
 ======================
 
-ProcessPoolExecutor和ThreadPoolExecutor思路一样, 只不过ProcessPoolExecutor的worker是进程, 那么就需要使用到multiprocessing.Process来包装
+concurrent.futures.ProcessPoolExecutor并没有使用multiprocess.Pool
 
-大概流程图是这样:
+multiprocessing.Pool和ProcessPoolExecutor都是worker进程会一直在queue监听拿到queue中的任务一直执行, 直到异常或者收到通知需要退出才会退出
 
-.. code-block::
+没有使用multiprocessing.Pool可能觉得multiprocessing.Pool中太复杂了吧?
 
-    main_thread -启动-> management_thread   ----call_queue----->         multiprocessing.Process
-                                            (call_queue是multiprocessing.Queue)
-                                            (result_queue是multiprocessing.SimpleQueue)
-                                            <---result_queue----         multiprocessing.Process
-                                                 |
-                                                 |
-     submit --向result_queue发送一个None唤醒----->
+ProcessPoolExecutor和ThreadPoolExecutor思路一样, 只不过ProcessPoolExecutor的worker是进程(multiprocess.Process), 而queue也是multiprocess.Queue
 
-
-
-
-ProcessPoolExecutor先启动多个multiprocessing.Process作为worker, 以及两个multiprocessing.Queue, 分别是call_queue和result_queue(当然实现不太一样, 但是都是queue)
-
-然后启动一个manage thread, 该线程负责从待处理队列中获取一个task, 通过call_queue发送给worker, 然后worker会把结果通过result_queue发送给manage thread
-
-然后manage thread会根据结果, 修改对应的Future的状态. 而当调用ProcessPoolExecutor.submit的时候, 主线程会将task添加到待处理队列, 然后
-
-发送一个None到result_queue, 这样是为了唤醒manage thread, 当manage thread被唤醒的时候会去查看result_queue得到的是否是None, 如果是None
-
-则从待处理队列中获取task, 发送给worker, 否则更新Future的状态
-
-
-而multiprocessing.Queue的实现则是进程间通信是用单向(非双向)pipe, 同时Queue的容量是使用更底层的_multiprocessing.SemLock来实现计数
-
-其实_multiprocessing.SemLock功能上就是一个Semaphore. 这样一端要调用put的时候, 检查semlock是否能获取, 能获取说明计数没用完, 否则证明queue已经满了
-
-同时单向的pipe使得get的一端无法put, 那么就不影响semlock的计数了. 同时multiprocessing.Queue的put是异步的, 也就是背后开启了一个线程, 称为feed thread, 专门从
-
-待发送的buffer中获取到下一个发送对象, 然后序列化(multiprocess封装的pickle)为bytes, 通过pipe发送出去.
-
-主线程通知feed thread是通过threading.Condition
 
 
 .. code-block::
 
-    multiprocess.Queue
+    
+                                                                                                   P1
+    
+                  WorkItem(fn, Future)                       CallItem(worker_id, fn)
+    ProcessPool -----管理进程------------> manager_thread  ------call_queue------------->          P2
+    
+    
+                                                           <-----result_queue----------->          P3
+                                                              ResultItem(worker_id, result)
 
-     main thread   -----threading.Condition通知-->    feed thread(multiprocess.Queue启动的子线程)
-          put                                            |
-      把obj存储到                                        |
-           |                                             |
-           ------>----- 存储待发送内容的buffer -->    从bufer中拿到obj           --通过单向pipe发送bytes---> pipe --->
-                                                       pickle拿到的obj为bytes
 
 
-而multiprocess.SimpleQueue和multiprocess.Queue的区别在于SimpleQueue, **SimpleQueue只是一个读加锁写不加锁, 并且没有容量的, 同步的单向pipe的包装**:
+WorkItem, CallItem, ResultItem               
+------------------------------------
 
-*Simplified Queue type -- really just a locked pipe*
+在ThreadPoolExecutor中, 只有WorkItem, WorkItem和Future关联在一起, 执行的时候得到WorkItem, 然后更新WorkItem中的Future的状态
 
-所以在ProcessPoolExecutor中, result_queue是一个SimpleQueue, 这样主进程和worker进程都可以向result_queue写入, 因为没有容量的限制, 允许多个进程写入
+而ProcessPoolExecutor中不仅仅有WorkItem, 还有CallItem和ResultItem
 
-而读取是需要加锁的, 因为在接收端可以是多个线程读. 同时SimpleQueue是同步的, 也就是SimpleQueue没有发送线程, 当调用put的时候会等待pipe的发送结束.
+
+.. code-block:: python
+
+    class _WorkItem(object):
+        def __init__(self, future, fn, args, kwargs):
+            self.future = future
+            self.fn = fn
+            self.args = args
+            self.kwargs = kwargs
+
+    class _ResultItem(object):
+        def __init__(self, work_id, exception=None, result=None):
+            self.work_id = work_id
+            self.exception = exception
+            self.result = result
+
+    class _CallItem(object):
+        def __init__(self, work_id, fn, args, kwargs):
+            self.work_id = work_id
+            self.fn = fn
+            self.args = args
+            self.kwargs = kwargs
+
+WorkItem依然是Future和fn关联, 然后CallItem在而是worker_id和fn相关联, 而ResultItem则是worker_id和result相关联
+
+向进程发送的是CallItem, 因为进程不需要直到Future(因为它直到Future也没用呀), 所以进程worker只需要直到发送给自己的fn就好了, 同时
+
+进程执行完fn只会, 发送ResultItem给主进程, 主进程需要通过worker_id去查找WorkItem, 然后更新Future.result或者Future.exception
+
+
+submit
+-------------
+
+submit的过程和ThreadPoolExecutor一样
+
+.. code-block:: python
+
+    class ProcessPoolExecutor(_base.Executor):
+    
+        def __init__(self, max_workers=None):
+
+            # 创建_call_queue和_result_queue
+            self._call_queue = multiprocessing.Queue(self._max_workers +
+                                                     EXTRA_QUEUED_CALLS)
+            self._call_queue._ignore_epipe = True
+            self._result_queue = SimpleQueue()
+            return
+
+        def submit(self, fn, *args, **kwargs):
+            with self._shutdown_lock:
+                if self._broken:
+                    raise BrokenProcessPool('A child process terminated '
+                        'abruptly, the process pool is not usable anymore')
+                if self._shutdown_thread:
+                    raise RuntimeError('cannot schedule new futures after shutdown')
+    
+                f = _base.Future()
+                # 创建WorkItem
+                w = _WorkItem(f, fn, args, kwargs)
+    
+                # 这里拿住了self._shutdown_lock
+                # 所以一次只能submit一次
+                # 但是因为submit应该是很快的操作, 所以一次一个不是问题
+                # 存储待执行的item
+                self._pending_work_items[self._queue_count] = w
+                self._work_ids.put(self._queue_count)
+                # 下标加1
+                self._queue_count += 1
+                # 这里要唤醒_result_queue去把self._pending_work_items中的WorkItem发送给worker
+                # Wake up queue management thread
+                self._result_queue.put(None)
+    
+                self._start_queue_management_thread()
+                return f
+
+queue_management_thread
+----------------------------
+
+这里是启动一个管理线程去把任务发送给worker, 同时接受worker的结果, 这里为了简便, 发送任务的通知也使用了self._result_queue, 不然又多出一个queue, 有点麻烦
+
+.. code-block:: python
+
+    def _start_queue_management_thread(self):
+        # When the executor gets lost, the weakref callback will wake up
+        # the queue management thread.
+        def weakref_cb(_, q=self._result_queue):
+            q.put(None)
+        if self._queue_management_thread is None:
+            # 启动_queue_management_thread这个管理线程
+            # Start the processes so that their sentinels are known.
+            self._adjust_process_count()
+            self._queue_management_thread = threading.Thread(
+                    target=_queue_management_worker,
+                    args=(weakref.ref(self, weakref_cb),
+                          self._processes,
+                          self._pending_work_items,
+                          self._work_ids,
+                          self._call_queue,
+                          self._result_queue))
+            self._queue_management_thread.daemon = True
+            self._queue_management_thread.start()
+            _threads_queues[self._queue_management_thread] = self._result_queue
+
+
+    def _queue_management_worker(executor_reference,
+                                 processes,
+                                 pending_work_items,
+                                 work_ids_queue,
+                                 call_queue,
+                                 result_queue):
+        reader = result_queue._reader
+    
+        while True:
+            # 把pending_work_items中的work_item发送给进程
+            _add_call_item_to_queue(pending_work_items,
+                                    work_ids_queue,
+                                    call_queue)
+    
+            # 监听自己的result_queue和worker进程的sentinels
+            sentinels = [p.sentinel for p in processes.values()]
+            assert sentinels
+            ready = wait([reader] + sentinels)
+            # 如果wait返回, 说明要么有数据需要读, 要么pipe已经broken了
+            if reader in ready:
+                result_item = reader.recv()
+            else:
+                # Mark the process pool broken so that submits fail right now.
+                # 这里是shutdown的过程
+                # 这里使得submit直接失败, 同时记录下pipe broken的异常
+                return
+            if isinstance(result_item, int):
+                # 这里如果读取到的是workerd的pid, 那么意味着worker已经退出了, 所以我们要清理资源
+                # Clean shutdown of a worker using its PID
+                # (avoids marking the executor broken)
+                assert shutting_down()
+                p = processes.pop(result_item)
+                p.join()
+                if not processes:
+                    shutdown_worker()
+                    return
+            elif result_item is not None:
+                # 如果result_item不是None, 表示是一个ResultItem
+                # 那么我们需要查询出对应的WorkerItem
+                work_item = pending_work_items.pop(result_item.work_id, None)
+                # work_item can be None if another process terminated (see above)
+                # 更新WorkerItem中的Future, 然后释放掉WorkerItem
+                if work_item is not None:
+                    if result_item.exception:
+                        work_item.future.set_exception(result_item.exception)
+                    else:
+                        work_item.future.set_result(result_item.result)
+                    # Delete references to object. See issue16284
+                    del work_item
+            # 下面是校验shutdown的过程
+
+
+所以这里如果ready是None的话, 就会直到开始下一次循环, 直接调用_add_call_item_to_queue去把pending_work_items中的待执行WorkerItem发送给进程
+
+_add_call_item_to_queue
+--------------------------
+
+
+发送CallItem给进程
+
+.. code-block:: python
+
+    def _add_call_item_to_queue(pending_work_items,
+                                work_ids,
+                                call_queue):
+        while True:
+            # 如果call_queue满了, 就不发送了
+            if call_queue.full():
+                return
+            # 拿出worker_id
+            try:
+                work_id = work_ids.get(block=False)
+            except queue.Empty:
+                return
+            else:
+                # 拿到worker_item
+                work_item = pending_work_items[work_id]
+
+                # 调用call_queue.put, 发送_CallItem
+                if work_item.future.set_running_or_notify_cancel():
+                    call_queue.put(_CallItem(work_id,
+                                             work_item.fn,
+                                             work_item.args,
+                                             work_item.kwargs),
+                                   block=True)
+                else:
+                    del pending_work_items[work_id]
+                    continue
+
+
+
+Worker进程
+------------------
+
+
+创建worker进程
+
+
+.. code-block:: python
+
+    def _adjust_process_count(self):
+        for _ in range(len(self._processes), self._max_workers):
+            # 直接使用了multiprocessing.Process
+            p = multiprocessing.Process(
+                    target=_process_worker,
+                    args=(self._call_queue,
+                          self._result_queue))
+            p.start()
+            self._processes[p.pid] = p
+
+
+
+
+    # worker进程启动只会在call_queue上监听
+    def _process_worker(call_queue, result_queue):
+        while True:
+            # 拿到_CallItem
+            call_item = call_queue.get(block=True)
+            if call_item is None:
+                # 拿到的call_item是None, 表示主进程要退出了
+                # Wake up queue management thread
+                # 所以自己也退出, 通知主进程
+                result_queue.put(os.getpid())
+                return
+            # 否则执行可执行对象
+            # 发送结果或者异常
+            try:
+                r = call_item.fn(*call_item.args, **call_item.kwargs)
+            except BaseException as e:
+                exc = _ExceptionWithTraceback(e, e.__traceback__)
+                result_queue.put(_ResultItem(call_item.work_id, exception=exc))
+            else:
+                result_queue.put(_ResultItem(call_item.work_id,
+                                             result=r))
+
+
+
+如果worker卡死怎么办?
+==========================
+
+
+如果一个worker卡死了, 那么我们直接通过os去杀死它就好了, 但是要注意处理进程死了之后, 重新生成新的worker进程
 
